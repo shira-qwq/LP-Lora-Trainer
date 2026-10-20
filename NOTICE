@@ -7,9 +7,8 @@ Apache License, Version 2.0 (see LICENSE).
 
 This repository is a fork of that project. It retains the upstream
 multi-engine application and adds a native KohakuMossTrainer CLI
-adaptation. The upstream trainer (D:\tools\KohakuMossTrainer in the
-developer's environment, distributed separately) is not modified and is
-not included in this repository.
+adaptation. The upstream trainer is installed separately by each user,
+is not modified by this fork, and is not included in this repository.
 
 Modified files relative to the upstream baseline (6d5f6de):
 
