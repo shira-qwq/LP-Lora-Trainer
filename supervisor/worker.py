@@ -68,7 +68,7 @@ def register_artifacts(store, task, noted=None):
             path = contained(candidate.path, root)
             if candidate.path.is_symlink(): continue
             complete = checkpoint_complete(path) if candidate.kind == "checkpoint" else False
-            if candidate.kind == "sample":
+            if candidate.kind in ("sample", "grid"):
                 from PIL import Image
                 with Image.open(path) as image: image.verify()
                 complete = True
@@ -85,7 +85,7 @@ def register_artifacts(store, task, noted=None):
             key = identity(task["task_id"], str(path))
             store.put("artifact", key, dict(artifact_id=key, task_id=task["task_id"], task_name=task["name"], kind=candidate.kind,
                 file_name=path.name, path=str(path), step=step, final=final, size_bytes=path.stat().st_size,
-                complete=complete, created_at=now(), preview_url=f"/api/v1/artifacts/{key}/preview" if candidate.kind == "sample" and complete else None,
+                complete=complete, created_at=now(), preview_url=f"/api/v1/artifacts/{key}/preview" if candidate.kind in ("sample", "grid") and complete else None,
                 architecture=task["architecture"], base_model=task["draft"]["base_model_path"]))
         except Exception as exc:
             # A malformed or half-written file is not a usable artifact; preserve
@@ -197,6 +197,12 @@ class Worker:
                                 progress.update(event.payload)
                                 if "loss" in event.payload:
                                     point = dict(step=progress["step"], loss=progress["loss"])
+                                    # Optional extras an adapter reads next to the loss (MOSS
+                                    # prints lr and grad_norm). Omitted keys never reach the row,
+                                    # so the other engines' metrics stay byte-identical.
+                                    for extra in ("lr", "grad_norm"):
+                                        if extra in event.payload:
+                                            point[extra] = event.payload[extra]
                                     if point != last_point:
                                         metrics.write(json.dumps(point) + "\n"); last_point = point
                                 if time.monotonic() - last_update >= 0.5:

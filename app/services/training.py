@@ -39,6 +39,41 @@ def safe_output_folder_name(value):
     return value
 
 
+def tail_lines(path, tail):
+    """The last `tail` lines of a log, read backwards in chunks (never the whole file)."""
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        pos = f.tell()
+        data = b""
+        while pos and data.count(b"\n") <= tail:
+            size = min(pos, 65536)
+            pos -= size
+            f.seek(pos)
+            data = f.read(size) + data
+    return data.decode("utf-8", errors="replace").splitlines()[-tail:]
+
+
+def log_head_tail(path, head=400, tail=800):
+    """The first `head` and the last `tail` lines of a run log.
+
+    What the engine resolved (VRAM profile, placements) is printed in the first seconds;
+    the VRAM peaks come near the end. Reading both ends keeps a multi-GB log off the heap.
+    """
+    lines = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for _ in range(head):
+                line = f.readline()
+                if not line:
+                    break
+                lines.append(line.rstrip("\r\n"))
+        if path.stat().st_size:
+            lines.extend(tail_lines(path, tail))
+    except OSError:
+        return []
+    return lines
+
+
 class TrainingService:
     def __init__(self, store, engines, datasets):
         self.store, self.engines, self.datasets = store, engines, datasets
@@ -104,6 +139,34 @@ class TrainingService:
             out[architecture] = self._draft_params(params)
         return out
 
+    @staticmethod
+    def _draft_explicit(value):
+        """The parameter keys the user edited (deduplicated, bounded, strings only)."""
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)):
+            raise ServiceError("暂存内容格式不正确：explicit_params")
+        out = []
+        seen = set()
+        for key in list(value)[:DRAFT_PARAM_LIMIT]:
+            if not isinstance(key, str) or not key or len(key) > 200 or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+    def _draft_explicit_map(self, value):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ServiceError("暂存内容格式不正确：explicit_by_architecture")
+        out = {}
+        for architecture, keys in list(value.items())[:DRAFT_ARCHITECTURE_LIMIT]:
+            if not isinstance(architecture, str) or not architecture or len(architecture) > 64:
+                continue
+            out[architecture] = self._draft_explicit(keys)
+        return out
+
     def save_draft(self, payload):
         record = dict(
             draft=dict(
@@ -115,8 +178,10 @@ class TrainingService:
                 dataset_id=self._draft_text(payload.get("dataset_id"), "dataset_id"),
                 output_dir=self._draft_text(payload.get("output_dir"), "output_dir"),
                 params=self._draft_params(payload.get("params")),
+                explicit_params=self._draft_explicit(payload.get("explicit_params")),
             ),
             params_by_architecture=self._draft_architecture_params(payload.get("params_by_architecture")),
+            explicit_by_architecture=self._draft_explicit_map(payload.get("explicit_by_architecture")),
             updated_at=now(),
         )
         return self.store.put("meta", DRAFT_KEY, record)
@@ -164,6 +229,12 @@ class TrainingService:
         # Tasks created before output_name existed use the task name as the model prefix.
         draft["output_name"] = saved.get("output_name") or saved.get("name", "")
         draft["params"] = dict(saved.get("params") or {})
+        # Which keys the user had edited. Tasks submitted before that was recorded have
+        # no list, and their stored params are exactly what the old flow wrote in full:
+        # reuse them as overrides instead of silently ignoring all of them.
+        stored_explicit = saved.get("explicit_params")
+        draft["explicit_params"] = (list(stored_explicit) if isinstance(stored_explicit, list)
+                                    else list(draft["params"]))
         # Earlier tasks store the resolved per-job output directory. A new
         # submission must use the user's output root, never nest in an old job.
         if draft["output_dir"] == t["output_dir"]:
@@ -208,13 +279,19 @@ class TrainingService:
             raise ServiceError("找不到对应引擎适配器，仍可导出 LP 完整备份", 422)
         config = {key: self._draft_text(payload.get(key), key) for key in DRAFT_LIMITS}
         config["params"] = self._draft_params(payload.get("params"))
+        # The export renders only the changed fields, like a submitted job does.
+        config["explicit_params"] = (self._draft_explicit(payload.get("explicit_params"))
+                                     if payload.get("explicit_params") is not None
+                                     else list(config["params"]))
         config["dataset_path"] = payload.get("dataset_path") or ""
         try:
             text, warnings = adapter.export_parameters(config)
             files = adapter.export_parameter_files(config)
         except (ValueError, TypeError, KeyError, NotImplementedError) as exc:
             raise ServiceError(f"无法生成原生参数：{exc}", 422) from exc
-        if adapter.native_format not in {"toml", "yaml", "json"}:
+        # Python is a native kogine config format (KohakuMossTrainer): it must be
+        # exportable like TOML/YAML/JSON, not rejected by this whitelist.
+        if adapter.native_format not in {"toml", "yaml", "json", "python"}:
             raise ServiceError("适配器声明的导出格式不受支持", 422)
         return dict(engine_id=adapter.engine_id, engine_name=adapter.display_name or adapter.engine_id,
                     native_format=adapter.native_format, text=text, warnings=list(warnings),
@@ -288,6 +365,15 @@ class TrainingService:
             config = {**draft, "dataset_path": dataset["path"], "output_dir": str(Path(draft["output_dir"]) / safe_output_folder_name(draft.get("name")))}
             try:
                 native = adapter.native_config_text(config, preview / "dataset.toml")
+                # Optional: the engine's own generator can produce the authoritative config
+                # (inheritance + automatic GPU preset). It runs engine code, so it is a
+                # separate opt-in method; the pure rendering above stays the fallback.
+                official = getattr(adapter, "preview_native_config_text", None)
+                if callable(official):
+                    try:
+                        native = official(domain(r), config, preview / f"config.native.{adapter.native_format}")
+                    except (OSError, RuntimeError, ValueError, KeyError):
+                        pass
                 commands = adapter.preview_commands(domain(r), config, preview / f"config.native.{adapter.native_format}")
                 argv = list(commands[-1])
                 pipeline = [list(command) for command in commands]
@@ -334,10 +420,11 @@ class TrainingService:
                 self.store.put("task", key, summary)
                 return next(t for t in self.tasks() if t["task_id"] == key)
             except Exception:
-                # Delete only files created in this new job directory, never user inputs.
-                for p in job.iterdir():
-                    if p.is_file(): p.unlink()
-                job.rmdir()
+                # Delete only the new, uniquely-named job directory. It is created above,
+                # so nothing in it can be a user input; the engine's own config checker may
+                # have added __pycache__ next to the generated config, so remove the tree
+                # instead of files only (rmdir then failed and hid the real error).
+                shutil.rmtree(job, ignore_errors=True)
                 raise
 
     def stop(self, key, force):
@@ -363,12 +450,21 @@ class TrainingService:
         self.task(key)
         p = self.store.root / "jobs" / key / "stdout.log"
         if not p.is_file(): return []
-        # Read backwards in chunks, not the whole multi-GB training log.
-        with p.open("rb") as f:
-            f.seek(0, 2); pos = f.tell(); data = b""
-            while pos and data.count(b"\n") <= tail:
-                size = min(pos, 65536); pos -= size; f.seek(pos); data = f.read(size) + data
-        return data.decode("utf-8", errors="replace").splitlines()[-tail:]
+        return tail_lines(p, tail)
+
+    def runtime(self, key):
+        """What the engine itself reported about this run: resolved profile, placements, VRAM.
+
+        The adapter parses its own log wording; an engine without that hook gets an empty
+        report (the UI shows 未知) instead of LP guessing an effective configuration.
+        """
+        t = self.task(key)
+        empty = {"run": {}, "memory_profile": {}, "placement": {}, "vram": {}}
+        parse = getattr(ADAPTERS.get(t.get("engine_id")), "runtime_info", None)
+        p = self.store.root / "jobs" / key / "stdout.log"
+        if parse is None or not p.is_file():
+            return empty
+        return {**empty, **parse(log_head_tail(p))}
 
     def metrics(self, key):
         self.task(key)

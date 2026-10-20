@@ -31,7 +31,7 @@ PARAMS: tuple[Param, ...] = (
     # ---- basic / 模型 ----
     param("WEIGHTS", "MOSS-Image 权重目录", "string", "", "basic", "模型与编码器", path_kind="directory",
           native_key="WEIGHTS", required_for=("moss_image",),
-          help="含 transformer/、text_encoder/、vae/ 的目录，或单个 safetensors；本引擎只训练 MOSS-Image。"),
+          help="ComfyUI 模型目录（diffusion_models/ + text_encoders/ + vae/）、HF 目录（含 transformer/），或单个 DiT safetensors；本引擎只训练 MOSS-Image。"),
     param("VARIANT", "模型变体", "enum", "base", "basic", "模型与编码器",
           options=enum(["base", "sft"]), native_key="VARIANT"),
     param("TEXT_ENCODER", "文本编码器路径", "string", "", "basic", "模型与编码器", path_kind="file_or_directory",
@@ -54,7 +54,7 @@ PARAMS: tuple[Param, ...] = (
           '  "template": "tags",\n'
           '  "keep": ["artist"],\n'
           '  "shuffle": true,\n'
-          '  "tag_dropout": 0.0\n'
+          '  "tag_dropout": 0.1\n'
           '}',
           "advanced", "数据集", multiline=True, native_key="CAPTION", help_style="info",
           help="每种 template 的写法不同，选一种整段替换（值可照抄）：\n"
@@ -112,6 +112,11 @@ PARAMS: tuple[Param, ...] = (
           options=enum(["tags", "nl"]), help_style="info",
           help="决定 .txt 进入哪个字段：tags = 按逗号拆成标签（默认，配 template: tags）；"
                "nl = 整段文本作为自然语言（配 template: nl 或 mix）。"),
+    param("DATASET_SOURCE", "数据集源类型", "enum", "folder", "advanced", "数据集", native=False,
+          options=enum(["folder", "kohya"]),
+          help="folder = 递归整棵目录；kohya = 只扫描一级 <repeats>_<name>/ 子目录，"
+               "按目录名前缀计算重复次数。注意：folder 会递归，训练集里不要放含图片的 "
+               "cache/、.local-captioner/ 等工具目录（提交时会检查并拒绝）。"),
     param("NUM_WORKERS", "数据加载进程数", "int", 4, "advanced", "数据集", min=0, max=64, native_key="NUM_WORKERS"),
     param("SEED", "随机种子", "int", 0, "basic", "训练", min=0, max=4294967295, native_key="SEED"),
 
@@ -136,8 +141,12 @@ PARAMS: tuple[Param, ...] = (
     param("WD_RULES", "衰减规则", "enum", "moss", "advanced", "优化", options=enum(["moss", "none", "all"]),
           native_key="WD_RULES", help="moss：bias/norm/1-D 不衰减，最后一个 q/k norm 向 1 衰减。"),
     _json("BETAS", "Adam β", "[0.9, 0.95]", "优化", "JSON 数组。"),
-    _json("SCHEDULE", "学习率调度", '{"mode": "cosine", "warmup": 100, "end": -1}', "优化",
-          "JSON；mode/warmup/end。"),
+    _json("SCHEDULE", "学习率调度", '{"mode": "cosine", "warmup": 100, "end": -1, "min_value": 0.1}', "优化",
+          "JSON；mode/warmup/end/min_value（与官方 base 层一致）。"),
+    param("WARMUP", "Warmup 步数", "int", None, "basic", "优化", min=0, max=10000000, native=False,
+          help="留空 = 沿用 SCHEDULE 里的 warmup（默认调度为 100 步）。填写后只覆盖 SCHEDULE 的 "
+               "lr 子调度（{\"mode\": ...} 或 SCHEDULE['lr']），其余字段原样保留。"
+               "Warmup 必须小于训练步数，否则学习率永远停在 warmup 段；建议为步数的 1/10 左右。"),
     param("GRAD_CLIP", "梯度裁剪", "float", 1.0, "basic", "优化", min=0.0, max=100.0, native_key="GRAD_CLIP"),
     param("EMA", "EMA 衰减", "float", 0.0, "advanced", "优化", min=0.0, max=0.99999, native_key="EMA",
           help="0 表示关闭。"),
@@ -145,9 +154,9 @@ PARAMS: tuple[Param, ...] = (
     param("BATCHING", "批次方式", "enum", "tokens", "basic", "训练",
         options=enum(["tokens", "tokens_ffd", "count"]), native_key="BATCHING",
         help="tokens=按 token 数拼批（默认）；count=按 BATCH_SIZE 固定样本数。"),
-    param("MAX_TOKENS", "每批最大 token", "int", 16384, "basic", "训练",
+    param("MAX_TOKENS", "每批最大 token", "int", 12288, "basic", "训练",
         min=256, max=131072, native_key="MAX_TOKENS",
-        help="每个批次（图像+文本）的目标 token 数；显存不足时先降低它（如 4096）。"),
+        help="每个批次（图像+文本）的目标 token 数；默认与官方 base 层一致（12288）。显存不足时先降低它（如 4096）。"),
     param("BATCH_SIZE", "每批样本数", "int", 4, "basic", "训练",
         min=1, max=256, native_key="BATCH_SIZE",
         help="仅当批次方式为 count 时生效。"),
@@ -157,11 +166,11 @@ PARAMS: tuple[Param, ...] = (
     param("MICROBATCHES", "流水线微批次数", "int", 4, "advanced", "训练",
         min=1, max=64, native_key="MICROBATCHES",
         help="仅流水线并行（pipeline）时生效。"),
-    param("STEPS", "训练步数", "int", 1000, "basic", "训练", min=1, max=10000000, native_key="STEPS"),
+    param("STEPS", "训练步数", "int", 4000, "basic", "训练", min=1, max=10000000, native_key="STEPS"),
 
     # ---- 数据集（引擎 scripts/train/moss.py 的完整 DATA 段）----
     param("SIZE_STEP", "像素步长", "int", 16, "advanced", "数据集", min=1, max=64, native_key="SIZE_STEP"),
-    param("ASPECT_RANGE", "宽高比范围", "string", "(0.25, 4.0)", "advanced", "数据集", native_key="ASPECT_RANGE",
+    param("ASPECT_RANGE", "宽高比范围", "string", "(0.33, 3.0)", "advanced", "数据集", native_key="ASPECT_RANGE",
           help="Python 元组，如 (0.25, 4.0)。"),
     param("UPSCALE", "放大策略", "enum", "never", "advanced", "数据集",
           options=enum(["never", "to_area"]), native_key="UPSCALE"),
@@ -213,8 +222,12 @@ PARAMS: tuple[Param, ...] = (
     param("STEP_RELEASE", "步间显存释放", "string", "none", "advanced", "内存与加速", native_key="STEP_RELEASE",
           help="none / empty_cache / 每 N 步（填数字）。"),
     param("FUSED_STEP", "反向内更新参数", "bool", False, "advanced", "内存与加速", native_key="FUSED_STEP"),
-    param("BASE_PRECISION", "基础模型精度", "enum", "compute", "advanced", "内存与加速",
-          options=enum(["compute", "int8", "fp8", "fp8_compute", "mxfp8", "quant"]), native_key="BASE_PRECISION"),
+    param("BASE_PRECISION", "基础模型精度", "enum", "auto", "advanced", "内存与加速",
+          options=(("auto", "自动（按权重文件原样）"),) + enum(["compute", "int8", "fp8", "fp8_compute", "mxfp8", "quant"]),
+          native_key="BASE_PRECISION",
+          help="auto = 与官方默认一致：INT8 ConvRot 权重直接用文件里的 int8 基座训练（不解量化）；"
+               "compute = 解量化成 16-bit 稠密权重（更吃显存，仅在你明确需要时选）。"
+               "只有改动过的值才会写进配置；不写就等于官方 auto。"),
     param("FP8_RECIPE", "FP8 缩放策略", "enum", "row", "advanced", "内存与加速",
           options=enum(["tensor", "row", "block"]), native_key="FP8_RECIPE"),
     param("FP8_DGRAD", "FP8 输入梯度", "enum", "fp8", "advanced", "内存与加速",
@@ -223,7 +236,7 @@ PARAMS: tuple[Param, ...] = (
           help="Python 字典，如 {'checkpoint': 'sub-block', 'stream': 'ring'}。"),
 
     # ---- 并行 / 内核（补全）----
-    param("DIST_BACKEND", "分布式后端", "enum", "auto", "advanced", "并行", 
+    param("DIST_BACKEND", "分布式后端", "enum", "auto", "advanced", "并行",
           options=enum(["auto", "nccl", "gloo"]), native_key="DIST_BACKEND"),
     param("PIPELINE_SCHEDULE", "流水线调度", "enum", "1f1b", "advanced", "并行",
           options=enum(["gpipe", "1f1b", "interleaved-1f1b", "looped-bfs", "interleaved-zb", "zbv", "dualpipe-v", "async"]),
@@ -272,8 +285,8 @@ PARAMS: tuple[Param, ...] = (
     param("SAMPLE_PROMPTS", "采样提示词", "string", "[]", "preview", "采样", native_key="SAMPLE_PROMPTS",
           help="Python 列表，如 ['a cat']；空表示不生成预览。"),
     param("SAMPLE_NEGATIVE", "负向提示词", "string", "", "preview", "采样", native_key="SAMPLE_NEGATIVE"),
-    param("SAMPLE_EVERY", "每 N 步出图", "int", 0, "preview", "采样", min=0, max=100000, native_key="SAMPLE_EVERY",
-          help="0 表示关闭。"),
+    param("SAMPLE_EVERY", "每 N 步出图", "int", 500, "preview", "采样", min=0, max=100000, native_key="SAMPLE_EVERY",
+          help="0 表示关闭；不改动则沿用官方（500 步）。"),
     param("SAMPLE_STEPS", "采样步数", "int", 50, "preview", "采样", min=1, max=200, native_key="SAMPLE_STEPS"),
     param("SAMPLE_CFG", "CFG", "float", 3.0, "preview", "采样", min=0.0, max=30.0, native_key="SAMPLE_CFG"),
     param("SAMPLE_SHIFT", "shift", "float", 5.0, "preview", "采样", native_key="SAMPLE_SHIFT"),
@@ -296,9 +309,21 @@ PARAMS: tuple[Param, ...] = (
           options=enum(["none", "x0", "eps"]), native_key="WEIGHTING"),
 
     # ---- advanced / 显存与加速 ----
-    param("MEMORY_PROFILE", "显存档位", "enum", "balanced", "advanced", "内存与加速",
-          options=enum(["speed", "balanced", "low", "minimal", "auto", "manual"]), native_key="MEMORY_PROFILE",
-          help="选 non-manual 档位时，下面的检查点/流式/固定内存/优化器状态等手动项会被忽略（引擎要求）。"),
+    # The engine's catalog holds ~245 named profiles (including the official VRAM presets
+    # such as `ckpt-ring4-actoff-optstream-gradoff`); new engine versions add more, so this
+    # is free text rather than a frozen enum. `kohakumoss-config list` prints the short names,
+    # `list --all` every catalog profile. "auto" lets the engine pick the fastest profile
+    # that fits the card.
+    param("MEMORY_PROFILE", "显存档位", "string", "auto", "advanced", "内存与加速",
+          native_key="MEMORY_PROFILE",
+          help="留 auto = 引擎按实际显存自动选择官方预设（推荐）。也可填官方任意档位名，"
+               "如 speed / balanced / low / minimal / manual，或 kohakumoss-config list --all "
+               "中的完整档位名（如 ckpt-ring4-actoff-optstream-gradoff）。"
+               "选 non-manual 档位时，下面的检查点/流式/固定内存/优化器状态等手动项会被忽略（引擎要求）。"),
+    param("VRAM", "显存预算（官方生成器）", "string", "", "advanced", "内存与加速", native=False,
+          help="留空 = 不传 --vram：官方按本机显存容量选择层（如 12GB 卡选 vram_12g）。"
+               "填 auto = 传 --vram auto（动态显存规划，更快但更吃显存，需要时再开）。"
+               "也可填数字（GiB，如 12 / 16 / 24）。此值只影响 kohakumoss-config new train 的参数，不写进训练配置。"),
     # ---- advanced / 显存与加速（手动项；仅在 MEMORY_PROFILE=manual 时生效）----
     param("CHECKPOINT", "检查点策略（manual）", "enum", "", "advanced", "内存与加速",
           options=enum(["", "none", "block", "sub-block", "selective"]), native_key="CHECKPOINT",
@@ -312,8 +337,15 @@ PARAMS: tuple[Param, ...] = (
     param("PINNED", "固定内存（manual）", "bool", True, "advanced", "内存与加速", native_key="PINNED",
           help="锁页主机内存；主机内存不足时会出现 cuMemHostAlloc 失败，请关闭。"),
     param("STREAM_RESIDENT", "流式设备槽位（manual）", "int", 0, "advanced", "内存与加速", min=0, max=64, native_key="STREAM_RESIDENT"),
-    param("TEXT_ENCODE", "文本编码器计划", "string", "{}", "advanced", "内存与加速", native_key="TEXT_ENCODE",
-          help="TEXT_ENCODE 只填计算字段（dtype/precision）；放置方式请用下面的「文本编码器放置」。"),
+    param("TEXT_ENCODE", "文本编码器计划", "string", "{}", "advanced", "内存与加速",
+          native_key="TEXT_ENCODE", multiline=True,
+          help="引擎原生 TextEncoderPlan 字段（JSON / Python 字面量）。留空 { } = 完全继承官方"
+               "（默认按官方 vram 层：12GB 卡是 memory=ring, ahead=4, batch=16, max_tokens=8192）。"
+               "只写你改的字段，其余字段自动沿用官方值（不会被整体替换）。\n"
+               "- LP 固定把 pinned 设为 false：引擎默认 pinned=true 会把文本编码器权重复制到锁页主机内存，"
+               "32GB 主机 + 12GB 显卡实测在 cuMemHostAlloc 处 CUDA 报显存不足。"
+               "主机内存充裕时在这里显式写 {\"pinned\": true} 即可恢复官方行为。\n"
+               "- 想改放置方式时写 memory/ahead/batch/max_tokens，例如 {\"memory\": \"offload\"}。"),
     param("GRAD_OFFLOAD", "梯度卸载（manual）", "bool", False, "advanced", "内存与加速", native_key="GRAD_OFFLOAD",
           help="跨 GRAD_ACC 微批次把梯度在主机 fp32 累加；省显存、慢一些。"),
     param("TEXT_DEVICE", "文本编码器设备", "string", "", "advanced", "内存与加速", native_key="TEXT_DEVICE",

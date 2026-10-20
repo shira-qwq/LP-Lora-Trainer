@@ -1423,12 +1423,17 @@ class APITests(unittest.TestCase):
         self.assertIsNone(self.client.get("/api/v1/training/draft").json()["draft"])
         body = dict(name="staged", installation_id="i", architecture="wan", base_model_path="m",
                     dataset_id="d", output_dir="o", params={"network_dim": 32, "bad": [1]},
-                    params_by_architecture={"wan": {"network_dim": 32}})
+                    params_by_architecture={"wan": {"network_dim": 32}},
+                    explicit_params=["network_dim", "network_dim", ""],
+                    explicit_by_architecture={"wan": ["network_dim"]})
         self.assertEqual(self.client.put("/api/v1/training/draft", json=body).status_code, 200)
         got = self.client.get("/api/v1/training/draft").json()
         # Values an engine could not accept are dropped, the rest of the draft is kept.
         self.assertEqual(got["draft"]["params"], {"network_dim": 32})
         self.assertEqual(got["params_by_architecture"], {"wan": {"network_dim": 32}})
+        # The override list survives a round trip, deduplicated and strings only.
+        self.assertEqual(got["draft"]["explicit_params"], ["network_dim"])
+        self.assertEqual(got["explicit_by_architecture"], {"wan": ["network_dim"]})
         # Another client of the same data root reads the same staged form.
         restarted = create_app(self.paths, start_worker=False)
         self.assertEqual(restarted.state.store.get("meta", "training_draft")["draft"]["name"], "staged")

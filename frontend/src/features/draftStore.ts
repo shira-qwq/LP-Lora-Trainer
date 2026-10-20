@@ -22,20 +22,32 @@ const LEGACY_STORAGE_KEY = 'lp.training.draft'
 const LEGACY_VERSION = 1
 const MAX_TEXT = 2048
 const MAX_ARCHITECTURES = 64
+const MAX_EXPLICIT = 500
 
 export interface StoredDraft {
   draft: TrainingDraft
   /** Parameter values remembered per base-model type. */
   paramsByArchitecture: Record<string, DraftParams>
+  /** Which of those values the user edited, per base-model type. */
+  explicitByArchitecture: Record<string, string[]>
   updatedAt: string | null
 }
 
 export function emptyDraft(): TrainingDraft {
-  return { name: '', output_name: '', installation_id: '', architecture: '', base_model_path: '', dataset_id: '', output_dir: '', params: {} }
+  return { name: '', output_name: '', installation_id: '', architecture: '', base_model_path: '', dataset_id: '', output_dir: '', params: {}, explicit_params: [] }
 }
 
 function asText(value: unknown): string {
   return typeof value === 'string' ? value.slice(0, MAX_TEXT) : ''
+}
+
+function asExplicit(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const out: string[] = []
+  for (const raw of value.slice(0, MAX_EXPLICIT)) {
+    if (typeof raw === 'string' && raw && raw.length <= 200 && !out.includes(raw)) out.push(raw)
+  }
+  return out
 }
 
 function asParams(value: unknown): DraftParams {
@@ -60,6 +72,15 @@ function asArchitectureParams(value: unknown): Record<string, DraftParams> {
   return out
 }
 
+function asArchitectureExplicit(value: unknown): Record<string, string[]> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out: Record<string, string[]> = {}
+  for (const [architecture, keys] of Object.entries(value as Record<string, unknown>).slice(0, MAX_ARCHITECTURES)) {
+    if (architecture) out[architecture.slice(0, 64)] = asExplicit(keys)
+  }
+  return out
+}
+
 function asDraft(value: unknown): TrainingDraft | null {
   if (!value || typeof value !== 'object') return null
   const stored = value as Record<string, unknown>
@@ -72,6 +93,7 @@ function asDraft(value: unknown): TrainingDraft | null {
     dataset_id: asText(stored.dataset_id),
     output_dir: asText(stored.output_dir),
     params: asParams(stored.params),
+    explicit_params: asExplicit(stored.explicit_params),
   }
 }
 
@@ -84,7 +106,7 @@ function readLegacyDraft(): StoredDraft | null {
     if (!parsed || typeof parsed !== 'object' || parsed.version !== LEGACY_VERSION) return null
     const draft = asDraft(parsed.draft)
     if (!draft) return null
-    return { draft, paramsByArchitecture: asArchitectureParams(parsed.paramsByArchitecture), updatedAt: null }
+    return { draft, paramsByArchitecture: asArchitectureParams(parsed.paramsByArchitecture), explicitByArchitecture: {}, updatedAt: null }
   } catch {
     return null
   }
@@ -103,7 +125,12 @@ export async function loadDraft(): Promise<StoredDraft | null> {
   const response = await api.training.draft()
   const remote = asDraft(response?.draft)
   const stored: StoredDraft | null = remote
-    ? { draft: remote, paramsByArchitecture: asArchitectureParams(response.params_by_architecture), updatedAt: response.updated_at ?? null }
+    ? {
+        draft: remote,
+        paramsByArchitecture: asArchitectureParams(response.params_by_architecture),
+        explicitByArchitecture: asArchitectureExplicit(response.explicit_by_architecture),
+        updatedAt: response.updated_at ?? null,
+      }
     : null
   const legacy = readLegacyDraft()
   if (!legacy) return stored
@@ -113,7 +140,7 @@ export async function loadDraft(): Promise<StoredDraft | null> {
     return stored
   }
   try {
-    await saveDraft(legacy.draft, legacy.paramsByArchitecture)
+    await saveDraft(legacy.draft, legacy.paramsByArchitecture, legacy.explicitByArchitecture)
   } catch {
     return legacy // the shared store is unavailable; do not lose what was staged
   }
@@ -121,8 +148,16 @@ export async function loadDraft(): Promise<StoredDraft | null> {
   return legacy
 }
 
-export async function saveDraft(draft: TrainingDraft, paramsByArchitecture: Record<string, DraftParams>): Promise<void> {
-  await api.training.saveDraft({ ...draft, params_by_architecture: paramsByArchitecture })
+export async function saveDraft(
+  draft: TrainingDraft,
+  paramsByArchitecture: Record<string, DraftParams>,
+  explicitByArchitecture: Record<string, string[]> = {},
+): Promise<void> {
+  await api.training.saveDraft({
+    ...draft,
+    params_by_architecture: paramsByArchitecture,
+    explicit_by_architecture: explicitByArchitecture,
+  })
 }
 
 export async function clearDraft(): Promise<void> {

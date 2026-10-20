@@ -195,6 +195,29 @@ export interface TaskSummary {
 export interface MetricPoint {
   step: number
   loss: number
+  /** Optional per-step extras an adapter prints next to the loss (MOSS: lr, grad_norm). */
+  lr?: number
+  grad_norm?: number
+}
+
+/** Facts the engine itself reported about a run (never LP's static defaults). */
+export interface TaskRuntime {
+  run: { name?: string; algo?: string; precision?: string; device?: string; steps?: number }
+  memory_profile: { requested?: string; resolved?: string }
+  placement: { text_encoder?: string; vae?: string }
+  vram: {
+    peak_allocated_gib?: number
+    peak_reserved_gib?: number
+    peak_device_used_gib?: number
+    estimated_gib?: number
+    train_peak_allocated_gib?: number
+    train_peak_reserved_gib?: number
+    train_peak_step?: number
+    prewarm_peak_allocated_gib?: number
+    prewarm_peak_reserved_gib?: number
+    last_device_gib?: number
+    last_phase?: string
+  }
 }
 
 export interface DatasetIssueCount {
@@ -233,7 +256,7 @@ export interface Artifact {
   artifact_id: string
   task_id: string
   task_name: string
-  kind: 'checkpoint' | 'sample'
+  kind: 'checkpoint' | 'sample' | 'grid'
   file_name: string
   path: string
   step: number | null
@@ -332,6 +355,8 @@ export interface ParamSpec {
 export interface StoredTrainingDraft {
   draft: TrainingDraft | null
   params_by_architecture: Record<string, Record<string, string | number | boolean | null>>
+  /** Edited parameter keys per engine × base-model bucket. */
+  explicit_by_architecture?: Record<string, string[]>
   updated_at: string | null
 }
 
@@ -395,11 +420,13 @@ export interface InstallPlan {
   python_mirror_presets: InstallOption[]
 }
 
-export interface TaskConfiguration extends TrainingDraft {
+export interface TaskConfiguration extends Omit<TrainingDraft, 'explicit_params'> {
   format: 'lp-training-parameters'
   version: 1
   engine_id: string
   dataset_path: string | null
+  /** Tasks submitted before overrides were tracked carry no list. */
+  explicit_params?: string[]
 }
 
 export interface TrainingDraft {
@@ -411,6 +438,11 @@ export interface TrainingDraft {
   dataset_id: string
   output_dir: string
   params: Record<string, string | number | boolean | null>
+  /**
+   * Keys the user actually edited. `params` also holds every form default, so only
+   * these override the engine's own generated config; the rest stays inherited.
+   */
+  explicit_params: string[]
 }
 
 export interface TrainingExportSource extends TrainingDraft {
@@ -430,7 +462,7 @@ export interface PromptTemplateInput { name: string; prompt: string }
 export interface NativeParameterExport {
   engine_id: string
   engine_name: string
-  native_format: 'toml' | 'yaml' | 'json'
+  native_format: 'toml' | 'yaml' | 'json' | 'python'
   text: string
   warnings: string[]
   files?: { filename: string; text: string }[]
@@ -445,7 +477,7 @@ export interface ValidationResult {
   ok: boolean
   issues: ValidationIssue[]
   native_config: string | null
-  native_format: 'toml' | 'yaml' | 'json' | null
+  native_format: 'toml' | 'yaml' | 'json' | 'python' | null
   argv: string[] | null
   /** Ordered commands the supervisor will run (caching stages first, training last). */
   pipeline: string[][] | null

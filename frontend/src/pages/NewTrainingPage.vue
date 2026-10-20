@@ -44,6 +44,10 @@ function syncOutputNameFromTaskName() {
 }
 
 let paramsByArchitecture: Record<string, DraftParams> = {}
+/* Which keys the user edited, per engine × base-model bucket. A value equal to the LP
+   default is *not* evidence of intent, so overrides are only ever recorded from a real
+   interaction (typing, toggling, importing, applying a template). */
+let explicitByArchitecture: Record<string, string[]> = {}
 const restoredForm = ref(false)
 const resetOpen = ref(false)
 /* Saving stays disabled until the shared draft has been read, so an empty form
@@ -61,6 +65,7 @@ async function restoreStagedForm() {
       if (formDisposed) return
       const restored = restoreTaskConfiguration(config, store.engines, datasets.value)
       paramsByArchitecture = { [paramsKey(restored.draft.architecture, restored.draft.installation_id)]: { ...restored.draft.params } }
+      explicitByArchitecture = { [paramsKey(restored.draft.architecture, restored.draft.installation_id)]: [...restored.draft.explicit_params] }
       Object.assign(draft, restored.draft)
       outputNameTouched.value = Boolean(config.output_name && config.output_name !== config.name)
       restoredForm.value = true
@@ -74,6 +79,7 @@ async function restoreStagedForm() {
       if (formDisposed) return
       if (staged) {
         paramsByArchitecture = { ...staged.paramsByArchitecture }
+        explicitByArchitecture = { ...staged.explicitByArchitecture }
         Object.assign(draft, { ...emptyDraft(), ...staged.draft, params: { ...staged.draft.params } })
         outputNameTouched.value = Boolean(staged.draft.output_name && staged.draft.output_name !== staged.draft.name)
         restoredForm.value = hasContent(staged.draft)
@@ -88,6 +94,7 @@ async function restoreStagedForm() {
         if (formDisposed) return
         if (staged) {
           paramsByArchitecture = { ...staged.paramsByArchitecture }
+          explicitByArchitecture = { ...staged.explicitByArchitecture }
           Object.assign(draft, { ...emptyDraft(), ...staged.draft, params: { ...staged.draft.params } })
           outputNameTouched.value = Boolean(staged.draft.output_name && staged.draft.output_name !== staged.draft.name)
           restoredForm.value = hasContent(staged.draft)
@@ -183,8 +190,9 @@ watch(
       if (formDisposed || draft.installation_id !== id) return
       // Prefer what this base-model type used before; otherwise carry over values
       // that still exist, and fall back to the engine default.
+      const paramsKeyFor = paramsKey(draft.architecture, draft.installation_id)
       const prev = { ...draft.params }
-      const remembered = paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] ?? {}
+      const remembered = paramsByArchitecture[paramsKeyFor] ?? {}
       const next: TrainingDraft['params'] = {}
       for (const p of c.params) {
         if (p.key in remembered) next[p.key] = remembered[p.key]
@@ -192,6 +200,10 @@ watch(
         else next[p.key] = p.default
       }
       draft.params = next
+      // Everything filled in above is a *default*, not an edit: the override list only
+      // keeps keys this engine actually exposes, so a reload never invents overrides.
+      const edited = draft.explicit_params.length ? draft.explicit_params : (explicitByArchitecture[paramsKeyFor] ?? [])
+      draft.explicit_params = edited.filter((key) => key in next)
       caps.value = c
     } catch (err) {
       capsError.value = err instanceof Error ? err.message : String(err)
@@ -215,14 +227,22 @@ watch(() => [draft.architecture, draft.installation_id] as const,
     if (next === previous && engine === previousEngine) return
     const specs = caps.value?.params ?? []
     if (!specs.length) return // capabilities not loaded yet; keep the restored draft
-    if (previous) paramsByArchitecture[paramsKey(previous, previousEngine)] = { ...draft.params }
-    const remembered = paramsByArchitecture[paramsKey(next, engine)] ?? {}
+    const previousKey = paramsKey(previous, previousEngine)
+    if (previous) {
+      paramsByArchitecture[previousKey] = { ...draft.params }
+      explicitByArchitecture[previousKey] = [...draft.explicit_params]
+    }
+    const key = paramsKey(next, engine)
+    const remembered = paramsByArchitecture[key] ?? {}
     const rebuilt: TrainingDraft['params'] = {}
     for (const p of specs) {
       if (p.architectures?.length && !p.architectures.includes(next)) continue
       rebuilt[p.key] = p.key in remembered ? remembered[p.key] : (p.default as TrainingDraft['params'][string])
     }
     draft.params = rebuilt
+    // The bucket's own override list travels with its values; nothing is inferred from
+    // a value merely matching (or missing) the LP default.
+    draft.explicit_params = (explicitByArchitecture[key] ?? []).filter((k) => k in rebuilt)
   })
 const tab = ref<Tab>('basic')
 // Apply a management-page template only after the shared draft and capabilities
@@ -238,7 +258,9 @@ watch(() => [formReady.value, caps.value, route.query.promptTemplate] as const, 
     const template = await api.promptTemplates.get(id)
     if (request !== templateRequest || formDisposed) return
     setParam(spec, template.prompt)
-    paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] = { ...draft.params }
+    const bucket = paramsKey(draft.architecture, draft.installation_id)
+    paramsByArchitecture[bucket] = { ...draft.params }
+    explicitByArchitecture[bucket] = [...draft.explicit_params]
     tab.value = 'preview'
     appliedTemplate = id
     toast('已使用提示词模板；可继续编辑当前任务内容', 'ok')
@@ -264,6 +286,7 @@ function applyDevicePlan() {
   const profile = specs.find((p) => p.key === 'MEMORY_PROFILE')
   if (!profile) return
   draft.params.MEMORY_PROFILE = 'auto'
+  markExplicit('MEMORY_PROFILE')
   toast('显存档位已设为 auto（由引擎按当前设备实测选择）', 'ok', 5000)
 }
 const groupCounts = computed(() => {
@@ -284,6 +307,11 @@ watch(parameterTabs, (list) => {
   if (list.length && !list.some((item) => item.value === tab.value)) tab.value = list[0].value
 }, { immediate: true })
 
+/** Record that the user changed `key`; this is the only source of config overrides. */
+function markExplicit(key: string) {
+  if (!draft.explicit_params.includes(key)) draft.explicit_params.push(key)
+}
+
 function setParam(p: ParamSpec, raw: string | boolean) {
   if (p.type === 'bool') draft.params[p.key] = raw as boolean
   else if (p.type === 'int' || p.type === 'float') {
@@ -293,6 +321,7 @@ function setParam(p: ParamSpec, raw: string | boolean) {
     // would silently drop it too.
     draft.params[p.key] = !text || !Number.isFinite(value) ? null : value
   } else draft.params[p.key] = raw as string
+  markExplicit(p.key)
 }
 
 /**
@@ -551,8 +580,8 @@ function importResolution(value: unknown): number {
   if (values.length !== 2 || values.some((item) => !Number.isInteger(item) || item <= 0)) return 0
   const width = caps.value?.params.find((p) => p.key === 'resolution_width')
   const height = caps.value?.params.find((p) => p.key === 'resolution_height')
-  if (width) draft.params[width.key] = values[0]
-  if (height) draft.params[height.key] = values[1]
+  if (width) { draft.params[width.key] = values[0]; markExplicit(width.key) }
+  if (height) { draft.params[height.key] = values[1]; markExplicit(height.key) }
   return width && height ? 2 : 0
 }
 
@@ -643,6 +672,7 @@ async function importParams(event: Event) {
       const value = convertImportedValue(spec, params[importedKey])
       if (value === undefined) continue
       draft.params[spec.key] = value
+      markExplicit(spec.key)
       importedCount += 1
     }
     importedCount += importResolution(params.resolution)
@@ -676,8 +706,12 @@ function persistStagedDraft() {
   window.clearTimeout(saveTimer)
   saveTimer = undefined
   if (!stagingReady) return
-  if (draft.architecture) paramsByArchitecture[paramsKey(draft.architecture, draft.installation_id)] = { ...draft.params }
-  void saveDraft(JSON.parse(JSON.stringify(draft)) as TrainingDraft, paramsByArchitecture)
+  if (draft.architecture) {
+    const bucket = paramsKey(draft.architecture, draft.installation_id)
+    paramsByArchitecture[bucket] = { ...draft.params }
+    explicitByArchitecture[bucket] = [...draft.explicit_params]
+  }
+  void saveDraft(JSON.parse(JSON.stringify(draft)) as TrainingDraft, paramsByArchitecture, explicitByArchitecture)
     .then(() => { saveFailed = false })
     .catch((err) => {
       // One notice per failure streak: a draft is convenience data, not a task.
@@ -714,6 +748,7 @@ async function resetStagedForm() {
     return
   }
   paramsByArchitecture = {}
+  explicitByArchitecture = {}
   // Keep the page usable without re-staging the cleared content.
   stagingReady = false
   // Clearing keeps the chosen base-model type and engine instance, exactly as the

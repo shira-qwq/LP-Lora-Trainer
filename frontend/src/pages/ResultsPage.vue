@@ -79,6 +79,9 @@ watch(artifacts, (a) => {
 })
 
 const checkpoints = computed(() => artifacts.value.filter((a) => a.kind === 'checkpoint').sort((a, b) => (b.step ?? 0) - (a.step ?? 0)))
+// MOSS writes samples/step_*/NNN.png plus one combined samples/grid.png. The backend
+// keeps the grid as its own kind, so it never enters the step groups below.
+const grids = computed(() => artifacts.value.filter((a) => a.kind === 'grid' && a.complete))
 // The backend leaves `step` empty for samples; groups come from the file name.
 const sampleGroups = computed(() => groupSamples(artifacts.value))
 
@@ -117,6 +120,14 @@ function openViewer(id: string) {
   const i = viewerImages.value.findIndex(({ a }) => a.artifact_id === id)
   viewerIndex.value = i >= 0 ? i : null
 }
+/* The combined grid.png keeps its own viewer: it is one tall summary sheet, not a
+   step thumbnail, so it is shown whole instead of being cropped to a square. */
+const gridItems = computed<ViewerItem[]>(() => grids.value.map((a) => ({
+  src: a.preview_url ? `${a.preview_url}?full=true` : null,
+  title: a.file_name,
+  subtitle: '采样总览（汇总图）',
+})))
+const gridViewerIndex = ref<number | null>(null)
 
 /* Publish */
 const settings = ref<AppSettings | null>(null)
@@ -193,6 +204,22 @@ async function reveal(path: string) {
             <span class="label-pill">采样对比</span>
             <span class="muted">选择最多 4 个 step / epoch 并排比较</span>
           </div>
+          <div v-if="grids.length" class="overview">
+            <span class="label-pill">采样总览</span>
+            <div class="overview__body">
+              <span class="muted">最新汇总图 grid.png，单独归档，不参与 step 分组（点击查看大图）</span>
+              <button
+                v-for="(g, i) in grids"
+                :key="g.artifact_id"
+                class="overview__img"
+                :title="`${g.file_name}（点击查看大图）`"
+                @click="gridViewerIndex = i"
+              >
+                <img v-if="g.preview_url" :src="g.preview_url" alt="" loading="lazy" decoding="async" />
+                <AppIcon v-else name="image" :size="24" />
+              </button>
+            </div>
+          </div>
           <div class="steps">
             <button
               v-for="g in sampleGroups"
@@ -221,6 +248,7 @@ async function reveal(path: string) {
             </div>
           </div>
           <ImageViewer v-model:index="viewerIndex" :items="viewerItems" />
+          <ImageViewer v-model:index="gridViewerIndex" :items="gridItems" />
         </template>
       </div>
     </section>
@@ -317,6 +345,41 @@ async function reveal(path: string) {
   flex-wrap: wrap;
   gap: 6px;
   margin-bottom: 18px;
+}
+/* Summary sheet: shown whole (never cropped), it is much taller than a sample tile. */
+.overview {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.overview__body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.overview__img {
+  display: block;
+  align-self: flex-start;
+  padding: 0;
+  border-radius: var(--radius-md);
+  background: var(--panel-strong);
+  overflow: hidden;
+  line-height: 0;
+  cursor: zoom-in;
+  transition: transform 0.15s var(--ease), box-shadow 0.15s;
+}
+.overview__img:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 0 0 2px var(--light);
+}
+.overview__img img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 240px;
+  max-height: 288px;
 }
 .compare {
   display: flex;

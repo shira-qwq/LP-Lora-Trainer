@@ -84,6 +84,13 @@ class TrainingInput(Input):
     dataset_id: str
     output_dir: str
     params: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    # The keys the user actually edited. `params` also carries every form default, so
+    # without this an adapter cannot tell "untouched default" from "chosen on purpose"
+    # and would override the engine's own generated config with LP's static defaults.
+    # An empty list means "nothing changed"; clients that omit the field entirely keep
+    # the older behaviour (every submitted key is an override), which is why the default
+    # is None rather than [].
+    explicit_params: list[str] | None = Field(default=None, max_length=500)
 
 
 class TrainingExportInput(TrainingInput):
@@ -110,6 +117,11 @@ class TrainingDraftInput(Input):
     output_dir: str = Field(default="", max_length=4096)
     params: dict[str, Any] = Field(default_factory=dict)
     params_by_architecture: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Which parameters the user edited, per engine × base-model bucket, so restoring a
+    # draft (or switching engines and back) keeps the override set instead of guessing
+    # from "value differs from the LP default".
+    explicit_params: list[str] | None = Field(default=None, max_length=500)
+    explicit_by_architecture: dict[str, list[str]] | None = Field(default=None)
 
 
 class StopInput(Input):

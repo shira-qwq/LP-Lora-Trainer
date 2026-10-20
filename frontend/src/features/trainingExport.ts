@@ -14,7 +14,8 @@ export function snapshotTrainingExport(draft: TrainingDraft, engineId: string | 
   return {
     name: draft.name, output_name: draft.output_name, installation_id: draft.installation_id, architecture: draft.architecture,
     base_model_path: draft.base_model_path, dataset_id: draft.dataset_id, output_dir: draft.output_dir,
-    params: { ...draft.params }, engine_id: engineId, dataset_path: datasetPath ?? null,
+    params: { ...draft.params }, explicit_params: [...draft.explicit_params],
+    engine_id: engineId, dataset_path: datasetPath ?? null,
   }
 }
 
@@ -44,7 +45,10 @@ export function restoreTaskConfiguration(config: TaskConfiguration,
   return {
     draft: { name: config.name, output_name: config.output_name || config.name, installation_id: engine?.installation_id ?? '', architecture: config.architecture,
       base_model_path: config.base_model_path, dataset_id: datasetId ?? '', output_dir: config.output_dir,
-      params: { ...config.params } },
+      params: { ...config.params },
+      // Older history entries carry no override list; their stored params are exactly
+      // what the old flow wrote in full, so reusing them as overrides is faithful.
+      explicit_params: Array.isArray(config.explicit_params) ? [...config.explicit_params] : Object.keys(config.params) },
     missingEngine: !engine, missingDataset: !datasetId,
   }
 }

@@ -553,6 +553,9 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/tasks/{key}/log")
     def logs(key: str, tail: int = Query(500, ge=1, le=10000)): return training.log(key, tail)
 
+    @app.get("/api/v1/tasks/{key}/runtime")
+    def runtime(key: str): return training.runtime(key)
+
     @app.post("/api/v1/tasks/{key}/stop", status_code=204)
     def stop(key: str, body: StopInput): training.stop(key, body.force)
 
@@ -571,7 +574,7 @@ def create_app(paths=None, token=None, start_worker=True, development=False):
     @app.get("/api/v1/artifacts/{key}/preview")
     def preview(key: str, full: bool = False):
         artifact = store.get("artifact", key)
-        if not artifact or artifact["kind"] != "sample" or not artifact["complete"]: raise ServiceError("Preview is unavailable", 404)
+        if not artifact or artifact["kind"] not in ("sample", "grid") or not artifact["complete"]: raise ServiceError("Preview is unavailable", 404)
         path = contained(artifact["path"], training.artifact_output_dir(artifact["task_id"]))
         if not path.is_file(): raise ServiceError("Sample image no longer exists", 404)
         from PIL import Image, ImageOps

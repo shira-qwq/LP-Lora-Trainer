@@ -29,6 +29,7 @@ import type {
   StoredTrainingDraft,
   TaskSummary,
   TaskConfiguration,
+  TaskRuntime,
   TrainingDraft,
   NativeParameterExport,
   TrainingExportSource,
@@ -157,9 +158,9 @@ export const api = {
   training: {
     exportParameters: (source: TrainingExportSource) => {
       // Pick wire fields explicitly: history also carries format/version metadata.
-      const { name, output_name, installation_id, architecture, base_model_path, dataset_id, output_dir, params, engine_id, dataset_path } = source
+      const { name, output_name, installation_id, architecture, base_model_path, dataset_id, output_dir, params, explicit_params, engine_id, dataset_path } = source
       return write(() => request<NativeParameterExport>('/training/export-parameters', {
-        method: 'POST', body: { name, output_name, installation_id, architecture, base_model_path, dataset_id, output_dir, params, engine_id, dataset_path },
+        method: 'POST', body: { name, output_name, installation_id, architecture, base_model_path, dataset_id, output_dir, params, explicit_params, engine_id, dataset_path },
       }))
     },
     validate: (draft: TrainingDraft) =>
@@ -175,7 +176,10 @@ export const api = {
         () => request<StoredTrainingDraft>('/training/draft'),
         () => ({ draft: null, params_by_architecture: {}, updated_at: null }),
       ),
-    saveDraft: (draft: TrainingDraft & { params_by_architecture: Record<string, Record<string, string | number | boolean | null>> }) =>
+    saveDraft: (draft: TrainingDraft & {
+      params_by_architecture: Record<string, Record<string, string | number | boolean | null>>
+      explicit_by_architecture: Record<string, string[]>
+    }) =>
       write(() => request<StoredTrainingDraft>('/training/draft', { method: 'PUT', body: draft })),
     clearDraft: () => write(() => request<void>('/training/draft', { method: 'DELETE' })),
   },
@@ -191,6 +195,12 @@ export const api = {
       read(
         () => request<MetricPoint[]>(`/tasks/${encodeURIComponent(id)}/metrics`),
         () => demo.metrics(id),
+      ),
+    // Facts the engine printed about this run (resolved VRAM profile, placements, peaks).
+    runtime: (id: string) =>
+      read(
+        () => request<TaskRuntime>(`/tasks/${encodeURIComponent(id)}/runtime`),
+        () => ({ run: {}, memory_profile: {}, placement: {}, vram: {} }),
       ),
     logTail: (id: string, lines: number) =>
       read(

@@ -11,6 +11,7 @@ import StatusTag from '@/components/StatusTag.vue'
 import ProgressBar from '@/components/ProgressBar.vue'
 import LossChart from '@/components/LossChart.vue'
 import EmptyState from '@/components/EmptyState.vue'
+import ImageViewer, { type ViewerItem } from '@/components/ImageViewer.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
 import SegTabs from '@/components/SegTabs.vue'
 import { api } from '@/api'
@@ -19,7 +20,9 @@ import TrainingExportDialog from '@/components/TrainingExportDialog.vue'
 import { snapshotTrainingExport } from '@/features/trainingExport'
 import { removeTask, store } from '@/features/store'
 import { toast, toastError } from '@/features/toast'
+import { useArtifacts } from '@/features/useArtifacts'
 import { useTaskLog, useTaskMetrics } from '@/features/useTask'
+import { groupSamples } from '@/features/samples'
 import {
   ACTIVE_TASK_STATES,
   engineName,
@@ -30,7 +33,7 @@ import {
   progressRatio,
   taskStateMeta,
 } from '@/features/format'
-import type { TaskSummary, TrainingExportSource } from '@/types/api'
+import type { TaskRuntime, TaskSummary, TrainingExportSource } from '@/types/api'
 
 const route = useRoute()
 const router = useRouter()
@@ -110,7 +113,16 @@ async function historyAction(kind: 'export' | 'use' | 'delete', target: TaskSumm
       await router.push({ name: 'train', query: { fromTask: target.task_id } })
     } else {
       const config = await api.tasks.configuration(target.task_id)
-      exportSource.value = snapshotTrainingExport(config, config.engine_id, config.dataset_path)
+      // History exported before overrides were tracked has no list; its stored params
+      // are exactly what the old flow wrote in full, so export them as overrides.
+      exportSource.value = snapshotTrainingExport({
+        name: config.name, output_name: config.output_name, installation_id: config.installation_id,
+        architecture: config.architecture, base_model_path: config.base_model_path,
+        dataset_id: config.dataset_id, output_dir: config.output_dir, params: { ...config.params },
+        explicit_params: Array.isArray(config.explicit_params)
+          ? [...config.explicit_params]
+          : Object.keys(config.params),
+      }, config.engine_id, config.dataset_path)
     }
   } catch (err) { toastError(err, kind === 'use' ? '使用配置' : '导出配置') }
   finally { historyBusy.value = false }
@@ -148,6 +160,110 @@ api.settings
   .then((s) => (logLimit.value = s.log_tail_lines))
   .catch(() => {})
 const { lines } = useTaskLog(selectedId, logLimit)
+
+/* ---- Latest samples, next to the loss curve (same screen) ---- */
+const { artifacts } = useArtifacts(selectedId)
+const sampleGroups = computed(() => groupSamples(artifacts.value))
+/** null = follow the newest step; a key pins the history view until toggled again. */
+const pinnedStep = ref<string | null>(null)
+const activeGroup = computed(() => {
+  const groups = sampleGroups.value
+  if (!groups.length) return null
+  return (pinnedStep.value && groups.find((g) => g.key === pinnedStep.value)) || groups[groups.length - 1]
+})
+const activeImages = computed(() => activeGroup.value?.items ?? [])
+const heroImage = computed(() => activeImages.value[0] ?? null)
+const viewerItems = computed<ViewerItem[]>(() => activeImages.value.map((a) => ({
+  src: a.preview_url ? `${a.preview_url}?full=true` : null,
+  title: a.file_name,
+  subtitle: activeGroup.value?.label,
+})))
+const viewerIndex = ref<number | null>(null)
+function pinStep(key: string) {
+  pinnedStep.value = activeGroup.value?.key === key ? null : key
+}
+
+/* ---- Run facts: what the engine reported, the live GPU and the submitted config ---- */
+const runtime = ref<TaskRuntime | null>(null)
+const submitted = ref<Record<string, string | number | boolean | null>>({})
+watch(selectedId, async (id) => {
+  runtime.value = null
+  submitted.value = {}
+  if (!id) return
+  const [rt, cfg] = await Promise.allSettled([api.tasks.runtime(id), api.tasks.configuration(id)])
+  if (id !== selectedId.value) return
+  if (rt.status === 'fulfilled') runtime.value = rt.value
+  if (cfg.status === 'fulfilled') submitted.value = cfg.value.params ?? {}
+}, { immediate: true })
+
+const gpu = computed(() => store.system?.gpu ?? null)
+const profileText = computed(() => {
+  const p = runtime.value?.memory_profile ?? {}
+  if (!p.resolved) return null
+  return p.requested && p.requested !== p.resolved ? `${p.resolved}（${p.requested} 自动解析）` : p.resolved
+})
+const placementText = computed(() => {
+  const p = runtime.value?.placement ?? {}
+  const parts = []
+  if (p.text_encoder) parts.push(`文本 ${p.text_encoder}`)
+  if (p.vae) parts.push(`VAE ${p.vae}`)
+  return parts.length ? parts.join(' · ') : null
+})
+const precisionText = computed(() => {
+  const r = runtime.value?.run ?? {}
+  const parts = [r.precision, r.algo].filter(Boolean)
+  return parts.length ? parts.join(' · ') : null
+})
+const peakText = computed(() => {
+  const v = runtime.value?.vram ?? {}
+  const peak = v.peak_reserved_gib ?? v.train_peak_reserved_gib
+  return peak === undefined ? null : `${peak.toFixed(2)} GiB`
+})
+const peakHint = computed(() => {
+  const v = runtime.value?.vram ?? {}
+  if (v.peak_allocated_gib !== undefined) {
+    return `引擎自报峰值：allocated ${v.peak_allocated_gib.toFixed(2)} GiB / reserved ${v.peak_reserved_gib?.toFixed(2) ?? '—'} GiB`
+  }
+  if (v.train_peak_reserved_gib !== undefined) {
+    return `引擎自报训练峰值：step ${v.train_peak_step ?? '—'}，reserved ${v.train_peak_reserved_gib.toFixed(2)} GiB`
+  }
+  return '引擎日志未记录显存峰值'
+})
+const tokensText = computed(() => {
+  const value = submitted.value.MAX_TOKENS
+  return value === null || value === undefined || value === '' ? null : String(value)
+})
+
+/* Sampling prompts are fixed with the run: they come from the submitted configuration. */
+function parseList(text: unknown): string[] {
+  if (typeof text !== 'string' || !text.trim()) return []
+  try {
+    const value = JSON.parse(text)
+    return Array.isArray(value) ? value.map((item) => String(item)) : []
+  } catch {
+    return []
+  }
+}
+const prompts = computed(() => parseList(submitted.value.SAMPLE_PROMPTS))
+const seeds = computed(() => parseList(submitted.value.SAMPLE_SEEDS))
+const sampleSettings = computed(() => {
+  const v = submitted.value
+  const parts = []
+  if (v.SAMPLE_STEPS) parts.push(`${v.SAMPLE_STEPS} steps`)
+  if (v.SAMPLE_CFG !== undefined && v.SAMPLE_CFG !== '') parts.push(`cfg ${v.SAMPLE_CFG}`)
+  if (v.SAMPLE_SHIFT !== undefined && v.SAMPLE_SHIFT !== '') parts.push(`shift ${v.SAMPLE_SHIFT}`)
+  if (typeof v.SAMPLE_SIZE === 'string' && v.SAMPLE_SIZE.trim()) parts.push(v.SAMPLE_SIZE.trim())
+  if (v.SAMPLE_EVERY) parts.push(`每 ${v.SAMPLE_EVERY} 步`)
+  return parts.join(' · ')
+})
+async function copyText(text: string, what: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    toast(`已复制${what}`, 'ok')
+  } catch (err) {
+    toastError(err, '复制')
+  }
+}
 
 /* Log view */
 const logQuery = ref('')
@@ -320,14 +436,125 @@ const duration = computed(() => {
         </div>
         <ProgressBar :ratio="ratio" :segments="24" />
 
-        <div class="chart-wrap">
-          <div class="row chart-head">
-            <span class="label-pill">Loss</span>
-            <span class="muted num">{{ points.length }} 个采样点</span>
-            <span class="spacer" />
-            <button class="chip" :class="{ 'is-on': chartTable }" @click="chartTable = !chartTable">表格</button>
+        <!-- What is really in effect: engine-reported facts, live monitor, submitted config. -->
+        <div class="runtime">
+          <div class="rt" :title="gpu ? `实时监控（nvidia-smi）：${gpu.name}` : '后端未提供 GPU 监控'">
+            <span class="rt__l">GPU</span>
+            <span class="rt__v">
+              {{ gpu ? gpu.name.replace('NVIDIA GeForce ', '') : '—' }}
+              <small v-if="gpu">{{ (gpu.memory_used_mb / 1024).toFixed(1) }} / {{ (gpu.memory_total_mb / 1024).toFixed(1) }} GB · {{ gpu.utilization ?? '—' }}%</small>
+              <small v-else>未检测到</small>
+            </span>
           </div>
-          <LossChart :points="points" :height="190" :show-table="chartTable" />
+          <div class="rt" title="引擎日志：MEMORY_PROFILE 的解析结果（不是 LP 的界面默认值）">
+            <span class="rt__l">生效显存档位</span>
+            <span class="rt__v">
+              {{ profileText ?? '—' }}
+              <small>{{ profileText ? '引擎日志' : '日志未记录' }}</small>
+            </span>
+          </div>
+          <div class="rt" title="引擎日志：文本编码器 / VAE 的实际放置方式">
+            <span class="rt__l">放置</span>
+            <span class="rt__v">
+              {{ placementText ?? '—' }}
+              <small>{{ placementText ? '引擎日志' : '日志未记录' }}</small>
+            </span>
+          </div>
+          <div class="rt" title="引擎日志：本次运行的算法与精度">
+            <span class="rt__l">精度</span>
+            <span class="rt__v">
+              {{ precisionText ?? '—' }}
+              <small>{{ runtime?.run?.device ?? '—' }}</small>
+            </span>
+          </div>
+          <div class="rt" :title="peakHint">
+            <span class="rt__l">显存峰值（引擎）</span>
+            <span class="rt__v">
+              {{ peakText ?? '—' }}
+              <small>{{ peakText ? 'reserved' : '日志未记录' }}</small>
+            </span>
+          </div>
+          <div class="rt" title="提交配置：MAX_TOKENS 是每批 token 预算，不是固定 batch size">
+            <span class="rt__l">Token 预算</span>
+            <span class="rt__v">
+              {{ tokensText ?? '—' }}
+              <small>{{ tokensText ? 'MAX_TOKENS / 批' : '提交配置缺失' }}</small>
+            </span>
+          </div>
+        </div>
+
+        <div class="detail__grid">
+          <div class="chart-wrap">
+            <div class="row chart-head">
+              <span class="label-pill">Loss</span>
+              <span class="muted num">{{ points.length }} 个采样点</span>
+              <span class="spacer" />
+              <button class="chip" :class="{ 'is-on': chartTable }" @click="chartTable = !chartTable">表格</button>
+            </div>
+            <LossChart :points="points" :height="190" :show-table="chartTable" />
+          </div>
+
+          <section class="samples" aria-label="最新采样">
+            <div class="row samples__head">
+              <span class="label-pill">最新采样</span>
+              <span v-if="activeGroup" class="muted num">{{ activeGroup.label }}</span>
+              <span class="spacer" />
+              <RouterLink
+                v-if="activeImages.length"
+                :to="{ name: 'results', params: { taskId: task.task_id } }"
+                class="chip"
+              >全部</RouterLink>
+            </div>
+
+            <button
+              v-if="heroImage"
+              class="samples__stage"
+              :title="`${heroImage.file_name}（点击放大）`"
+              @click="viewerIndex = 0"
+            >
+              <img v-if="heroImage.preview_url" :src="heroImage.preview_url" :alt="heroImage.file_name" />
+              <span v-else class="samples__empty">预览不可用</span>
+            </button>
+            <div v-else class="samples__stage samples__stage--empty">
+              <span class="samples__empty">
+                还没有采样图
+                <small>引擎按 SAMPLE_EVERY 在训练进程内生成</small>
+              </span>
+            </div>
+
+            <div v-if="sampleGroups.length" class="samples__steps">
+              <button
+                v-for="g in sampleGroups"
+                :key="g.key"
+                class="chip"
+                :class="{ 'is-on': activeGroup?.key === g.key }"
+                :title="pinnedStep === g.key ? '点击回到最新' : `查看 ${g.label}`"
+                @click="pinStep(g.key)"
+              >{{ g.label }}</button>
+            </div>
+
+            <div v-if="activeImages.length > 1" class="samples__thumbs">
+              <button
+                v-for="(a, i) in activeImages"
+                :key="a.artifact_id"
+                class="samples__thumb"
+                :title="a.file_name"
+                @click="viewerIndex = i"
+              >
+                <img v-if="a.preview_url" :src="a.preview_url" :alt="a.file_name" loading="lazy" />
+              </button>
+            </div>
+
+            <div v-if="prompts.length || sampleSettings" class="samples__prompt">
+              <p v-if="sampleSettings" class="samples__meta">{{ sampleSettings }}</p>
+              <div v-for="(p, i) in prompts.slice(0, 2)" :key="i" class="samples__pline">
+                <span class="samples__pidx">{{ i + 1 }}</span>
+                <span class="samples__ptext" :title="p">{{ p }}</span>
+                <button class="chip" @click="copyText(p, '提示词')">复制</button>
+              </div>
+              <p v-if="seeds.length" class="samples__meta">seed {{ seeds.join(', ') }}</p>
+            </div>
+          </section>
         </div>
       </div>
 
@@ -400,6 +627,7 @@ const duration = computed(() => {
           @click="historyAction('delete', menu.target)">删除</button>
       </div>
     </Teleport>
+    <ImageViewer v-model:index="viewerIndex" :items="viewerItems" />
     <TrainingExportDialog v-if="exportSource" :source="exportSource" @close="exportSource = null" />
     <ModalDialog v-if="deleteTarget" title="删除历史训练任务？" @close="!historyBusy && (deleteTarget = null)">
       <p>删除 <strong>{{ deleteTarget.name }}</strong> 的任务记录、配置快照、运行日志和指标。</p>
@@ -558,6 +786,156 @@ const duration = computed(() => {
   flex-direction: column;
   gap: 8px;
 }
+
+/* Loss and the newest sample share one screen; the engine's own numbers sit above. */
+.detail__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 16px;
+  align-items: start;
+}
+.runtime {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.rt {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.rt__l {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.rt__v {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rt__v small {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.samples {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: var(--radius-md);
+  background: var(--field);
+}
+.samples__head {
+  gap: 8px;
+}
+.samples__head .chip {
+  height: 22px;
+  font-size: 11px;
+}
+.samples__stage {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 148px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--code-bg);
+}
+.samples__stage img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.samples__stage--empty {
+  border: 1px dashed var(--line-strong);
+  background: transparent;
+}
+.samples__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 0 12px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  text-align: center;
+}
+.samples__empty small {
+  font-size: 10.5px;
+  opacity: 0.8;
+}
+.samples__steps,
+.samples__thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.samples__steps .chip {
+  height: 22px;
+  font-size: 11px;
+}
+.samples__thumb {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--code-bg);
+}
+.samples__thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.samples__prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.samples__meta {
+  margin: 0;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.samples__pline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.samples__pidx {
+  flex: none;
+  width: 14px;
+  font-size: 10px;
+  color: var(--text-3);
+}
+.samples__ptext {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.samples__pline .chip {
+  flex: none;
+  height: 22px;
+  font-size: 10.5px;
+}
 .chart-head .chip {
   height: 24px;
   font-size: 11px;
@@ -669,6 +1047,12 @@ const duration = computed(() => {
     grid-template-columns: 240px minmax(0, 1fr);
   }
   .metrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .detail__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .runtime {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
   .detail__bottom {
