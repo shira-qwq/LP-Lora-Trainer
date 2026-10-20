@@ -13,8 +13,6 @@ from adapters.kohaku_moss_trainer.adapter import KohakuMossTrainerAdapter
 from adapters.kohaku_moss_trainer.params import PARAMS
 from adapters.kohaku_moss_trainer.progress import parse_progress, runtime_info
 
-ENGINE = Path(r"D:\tools\KohakuMossTrainer")
-
 
 def spec(key):
     return next(p for p in PARAMS if p.key == key)
@@ -23,10 +21,15 @@ def spec(key):
 class MossAdapterTests(unittest.TestCase):
     def setUp(self):
         self.adapter = KohakuMossTrainerAdapter()
-        self.installation = SimpleNamespace(source_path=str(ENGINE),
+        self.tmp = Path(tempfile.mkdtemp(prefix="moss-tests-"))
+        # A minimal engine tree instead of a machine-specific checkout: validate()
+        # only needs the entry script to recognise the architecture.
+        self.engine = self.tmp / "engine"
+        (self.engine / "scripts" / "train").mkdir(parents=True)
+        (self.engine / "scripts" / "train" / "moss.py").write_text("", encoding="utf-8")
+        self.installation = SimpleNamespace(source_path=str(self.engine),
                                             python_executable="",
                                             installation_id="moss")
-        self.tmp = Path(tempfile.mkdtemp(prefix="moss-tests-"))
 
     def comfy_weights(self):
         root = self.tmp / "comfy"
@@ -128,7 +131,7 @@ class MossAdapterTests(unittest.TestCase):
         scripts = self.tmp / "venv" / "Scripts"
         scripts.mkdir(parents=True, exist_ok=True)
         (scripts / "kohakumoss-config.exe").write_bytes(b"")
-        return SimpleNamespace(source_path=str(ENGINE), python_executable=str(scripts / "python.exe"))
+        return SimpleNamespace(source_path=str(self.engine), python_executable=str(scripts / "python.exe"))
 
     def generate(self, params):
         captured = []
