@@ -61,10 +61,47 @@
 | Kohya / sd-scripts | 已实现 SD1 / SD2 / SDXL 单 GPU LoRA 原生 CLI 训练适配、配置生成、日志解析与产物登记 |
 | AI Toolkit | 静态识别、版本/实例管理、环境诊断及适配器安装流程；**尚未实现真实训练适配，不能提交训练** |
 | Musubi Tuner | 已实现缓存流水线（latents → text-encoder → 训练）与单 GPU LoRA 训练适配（13 个架构）、配置生成、日志解析与产物登记 |
+| KohakuMossTrainer（本 Fork 新增，实验性） | MOSS-Image LoRA 的原生 CLI 适配：官方显存预设、仅显式覆盖的参数、ComfyUI 权重目录、INT8 ConvRot、缓存与原生采样、Loss/采样图同屏 |
 
-Kohya 与 Musubi Tuner 的训练链路已经过模拟引擎的真实子进程自动化测试，**尚未使用真实 GPU、模型和上游引擎完成端到端训练验收**。不保证任意上游版本兼容，不保证中断保存 checkpoint，也不提供自动恢复训练状态。
+Kohya 与 Musubi Tuner 的训练链路已经过模拟引擎的真实子进程自动化测试，**尚未使用真实 GPU、模型和上游引擎完成端到端训练验收**。不保证任意上游版本兼容，不保证中断保存 checkpoint，也不提供自动恢复训练状态。KohakuMossTrainer 的验证状态见下方专节。
 
 应用不替用户下载、更新或删除引擎主仓库。clone/复制源码后，无需先绑定 Python，直接在引擎页确认“安装引擎环境”；应用准备项目内 uv，再调用该引擎的安装流程，终端实时显示并持久化日志。安装结束后自动发现并保存引擎解释器、执行诊断、回写状态；诊断未通过不会显示成功。应用 `python_runtime` 只运行标准库引导脚本，不安装训练依赖；基础 Python 由项目内 uv 管理，各引擎的 `venv` / `.venv` 独立。Kohya 官方安装器可能初始化 sd-scripts 子模块，AI Toolkit 官方 manager 可能安装其所需的 Node/ffmpeg。
+
+## KohakuMossTrainer 适配（本 Fork）
+
+> **当前状态：Experimental（实验性）。** 早期的 MOSS 短跑流程已通过，但最新一轮“以官方生成结果为基线、不再解量化 INT8 基座”的修复**尚未在 GPU 上复测**。在完成一次真实的权重加载与短训验证之前，请把 MOSS 适配视为可用于测试、但不保证训练结果稳定的功能。
+
+本仓库是 [LinXce/LP-Lora-Trainer](https://github.com/LinXce/LP-Lora-Trainer) 的 Fork，保留原项目全部多引擎能力（Kohya / AI Toolkit / Musubi Tuner）、原有界面与操作方式，只增强 **KohakuMossTrainer 原生 CLI** 支持。上游训练器的 GPU 检测、显存预设、量化加载、内核调优、缓存与采样均由 MOSS 原生机制执行，本项目**不修改上游训练器源码**。
+
+### 配置生成方式
+
+- 训练配置以官方 `kohakumoss-config new train` 的生成结果为基线；LP 只在其后追加用户改动，不再写入 121 项静态默认值。
+- 默认**不传 `--vram`**：官方按本机实际显存容量选择层（例如 12 GiB 显卡选择 `vram_12g`）。只有用户主动选择时才传 `--vram auto`（动态显存规划，更快但更吃显存），也可以填数字（GiB）指定预算。
+- 只有用户**显式修改**过的参数才参与配置修改；是否修改由界面/后端记录的显式覆盖列表（`explicit_params`）决定，不靠“值是否等于默认值”猜测。脚本直接调用 API 且未提供该列表时，按“提交的键都是覆盖”处理。
+- `SCHEDULE`、`TEXT_ENCODE`、`VAE_ENCODE` 等字典字段先读回官方 `use_config` 层的继承值，再按字段合并；其中 `SCHEDULE` 若填入子调度表则按原生语义整体替换。
+- `BASE_PRECISION` 默认继承官方（不写入），因此 INT8 ConvRot 权重保持原生量化行为；只有用户明确选择 `compute` 时才解量化。
+- **唯一的有意兼容差异**：`TEXT_PINNED` 默认为 `off`，在官方 `TEXT_ENCODE` 计划上补 `pinned=false`，避免 32GB 主机在 `cuMemHostAlloc` 处显存不足。选 `inherit` 则完全不写该字段，组合后的生效值与官方生成值一致（仅任务输入/输出路径、权重路径写法与数据集条目的 `weight` 元数据不同）。因此本项目不宣称“配置 100% 原生”；差异是显式、可关闭的兼容选项。
+
+### 已支持的 MOSS 工作流
+
+- **ComfyUI 权重目录**：`diffusion_models/` + `text_encoders/` + `vae/`、HF 目录（含 `transformer/`）或单个 DiT safetensors。
+- **INT8 ConvRot**：随官方精度设置加载，不再被 LP 强制解量化。
+- **原生缓存与训练**：latents → text encoder → 训练三个阶段均调用上游脚本；提交前用引擎自己的 `check` 校验最终配置。
+- **采样与监控**：解析官方日志中的 step / loss / lr / grad_norm，采样步数不会覆盖训练进度；任务页把 Loss 曲线与最新采样图放在同屏，并可点击历史 step 回看。
+- **结果页**：按 step 分组比较采样图，`grid.png` 作为汇总图单独展示。
+
+### Windows 安装、启动与引擎绑定
+
+1. **安装应用**：按下一节“从源码构建”执行 `install.cmd`，或直接使用包含 `python_runtime/`、`frontend/dist/` 与 `LP-Lora-Trainer.exe` 的完整交付目录；双击 `LP-Lora-Trainer.exe` 启动（详见“便携运行”）。
+2. **准备引擎**：把可信的 KohakuMossTrainer 源码放到 `engine/<实例名>/`，在引擎管理页重新扫描并确认识别为 MOSS。
+3. **安装引擎环境**：点击“安装引擎环境”，由上游安装流程创建其 `.venv`；完成后应用自动发现解释器并诊断。若已有环境，也可手动绑定后诊断。
+4. **基本操作**：在数据集页登记并扫描图片 → 新建训练页选择引擎、ComfyUI 权重目录与数据集 → 检查参数和原生配置预览 → 提交 → 在任务页查看 Loss/采样 → 在结果页发布到 ComfyUI 的 LoRA 目录。显存档位默认 `auto`；只有在明确需要时才改 `VRAM` 或手动内存项。
+
+### 已知边界
+
+- MOSS 适配目前只覆盖 MOSS-Image（Base / SFT），多卡与长训未验证。
+- 不做随机种子复现保证，不保证中断后 checkpoint 完整，也不提供训练状态恢复。
+- 旧的 `job.json` 没有显式覆盖记录，恢复或导出时按“全部参数都是覆盖”处理（与旧版行为一致）。
 
 ## 从源码构建（git clone 之后）
 

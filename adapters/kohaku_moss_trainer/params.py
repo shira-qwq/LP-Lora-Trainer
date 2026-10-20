@@ -342,10 +342,16 @@ PARAMS: tuple[Param, ...] = (
           help="引擎原生 TextEncoderPlan 字段（JSON / Python 字面量）。留空 { } = 完全继承官方"
                "（默认按官方 vram 层：12GB 卡是 memory=ring, ahead=4, batch=16, max_tokens=8192）。"
                "只写你改的字段，其余字段自动沿用官方值（不会被整体替换）。\n"
-               "- LP 固定把 pinned 设为 false：引擎默认 pinned=true 会把文本编码器权重复制到锁页主机内存，"
-               "32GB 主机 + 12GB 显卡实测在 cuMemHostAlloc 处 CUDA 报显存不足。"
-               "主机内存充裕时在这里显式写 {\"pinned\": true} 即可恢复官方行为。\n"
+               "- pinned 由下面的“文本编码器锁页（兼容）”决定；若在这里显式写 pinned，以这里为准。\n"
                "- 想改放置方式时写 memory/ahead/batch/max_tokens，例如 {\"memory\": \"offload\"}。"),
+    param("TEXT_PINNED", "文本编码器锁页（兼容）", "enum", "off", "advanced", "内存与加速",
+          options=enum(["off", "inherit", "on"]), native=False,
+          help="LP 兼容策略：不写入训练配置本身，只决定是否在官方 TEXT_ENCODE 上补一个 pinned 字段。\n"
+               "- off（默认）：补 pinned=false。引擎默认 pinned=true 会把文本编码器权重复制到锁页主机内存，"
+               "32GB 主机 + 12GB 显卡实测在 cuMemHostAlloc 处 CUDA 报显存不足。"
+               "这是无覆盖时与官方生成值唯一的有意差异。\n"
+               "- inherit：完全继承官方（不补该字段，最接近原生）；主机内存充裕时选它。\n"
+               "- on：强制 pinned=true（恢复官方锁页行为）。"),
     param("GRAD_OFFLOAD", "梯度卸载（manual）", "bool", False, "advanced", "内存与加速", native_key="GRAD_OFFLOAD",
           help="跨 GRAD_ACC 微批次把梯度在主机 fp32 累加；省显存、慢一些。"),
     param("TEXT_DEVICE", "文本编码器设备", "string", "", "advanced", "内存与加速", native_key="TEXT_DEVICE",

@@ -463,18 +463,35 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 f"warmup 段，请把 Warmup 调小（约步数的 1/10）或增大步数"),)
         return ()
 
+    @staticmethod
+    def _pinned_policy(values):
+        """`TEXT_PINNED` -> the `pinned` value LP appends, or None to inherit.
+
+        This is LP's one documented compatibility deviation: the engine's
+        TextEncoderPlan.pinned defaults to True and copies the encoder into page-locked
+        host memory, which failed with CUDA_ERROR_OUT_OF_MEMORY (cuMemHostAlloc) on a
+        32 GB host. "inherit" leaves the official value untouched (fully native).
+        """
+        raw = str(values.get("TEXT_PINNED") or "off").strip().lower()
+        if raw in ("inherit", "auto", "official"):
+            return None
+        if raw in ("on", "true", "1"):
+            return True
+        return False  # off / unknown: LP's OOM-safe default
+
     def _text_plan(self, values, explicit=None):
         """The cache pass's TEXT_ENCODER_KWARGS["plan"].
 
         The cache stage has its own baseline (`PRECOMPUTE_DEFAULTS`: memory auto,
         batch 32, max_tokens 16384), and `text_encoder_kwargs` only carries TEXT_ENCODE's
         *compute* fields into it. So only the fields the user changed are written here,
-        plus LP's `pinned: False` policy: the engine's TextEncoderPlan.pinned defaults to
-        True and copies the encoder into page-locked host memory, which failed with
-        CUDA_ERROR_OUT_OF_MEMORY (cuMemHostAlloc) on this 32 GB host.
+        plus the `TEXT_PINNED` policy (see `_pinned_policy`).
         """
         keys = set(explicit) if explicit is not None else {"TEXT_ENCODE", "TEXT_ENCODER_PLAN"}
-        plan = {"pinned": False}
+        plan = {}
+        policy = self._pinned_policy(values)
+        if policy is not None:
+            plan["pinned"] = policy
         if "TEXT_ENCODE" in keys:
             plan.update(self._parse_mapping(values.get("TEXT_ENCODE")))
         if "TEXT_ENCODER_PLAN" in keys:
@@ -629,16 +646,18 @@ class KohakuMossTrainerAdapter(EngineAdapter):
                 schedule = self._with_warmup(schedule, warmup)
             if schedule:
                 lines.append("SCHEDULE = " + repr(schedule))
-        # LP policy: TextEncoderPlan.pinned defaults to True and copies the encoder into
-        # page-locked host memory (cuMemHostAlloc -> CUDA OOM on this 32 GB host). Only
-        # `pinned` is set here, on top of the official value, so memory / ahead / batch /
-        # max_tokens stay exactly what the selected VRAM layer chose.
+        # `TEXT_PINNED` is LP's compatibility policy, not an official field: with "off"
+        # it appends pinned=false on top of the official value (memory / ahead / batch /
+        # max_tokens stay exactly what the selected VRAM layer chose); "inherit" writes
+        # nothing, so the config is byte-for-byte official for this knob.
         inherited_plan = baseline.get("TEXT_ENCODE")
         if isinstance(inherited_plan, dict) or "TEXT_ENCODE" in explicit:
             plan = dict(inherited_plan) if isinstance(inherited_plan, dict) else {}
             if "TEXT_ENCODE" in explicit:
                 plan.update(self._parse_mapping(values.get("TEXT_ENCODE")))
-            plan.setdefault("pinned", False)
+            policy = self._pinned_policy(values)
+            if policy is not None:
+                plan.setdefault("pinned", policy)
             if plan != (inherited_plan or {}):
                 lines.append("TEXT_ENCODE = " + repr(plan))
         # CAPTION is whole-replace by design: the form holds one complete template, and

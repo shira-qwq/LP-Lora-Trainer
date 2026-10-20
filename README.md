@@ -61,10 +61,47 @@ Adaptation coverage and open gaps are listed under "Engine support and limitatio
 | Kohya / sd-scripts | Native single-GPU LoRA CLI training for SD1 / SD2 / SDXL, with config generation, log parsing and artifact registration. |
 | AI Toolkit | Static discovery, instance/version management, environment diagnostics and its adapter install flow; **training submission is not implemented yet and cannot be submitted**. |
 | Musubi Tuner | Cache pipeline (latents → text encoder → training) plus single-GPU LoRA training for 13 architectures, with config generation, log parsing and artifact registration. |
+| KohakuMossTrainer (added by this fork, experimental) | Native CLI adaptation for MOSS-Image LoRA: official VRAM presets, explicit-only overrides, ComfyUI weight folders, INT8 ConvRot, cache and native sampling, loss and samples on one screen. |
 
-Kohya and Musubi Tuner training chains are covered by real-subprocess automated tests using simulated engines, but have **not** been validated end to end with real GPUs, models and upstream engines. Arbitrary upstream versions are not guaranteed to work, checkpoints are not guaranteed to survive interruption, and training-state recovery is not provided.
+Kohya and Musubi Tuner training chains are covered by real-subprocess automated tests using simulated engines, but have **not** been validated end to end with real GPUs, models and upstream engines. Arbitrary upstream versions are not guaranteed to work, checkpoints are not guaranteed to survive interruption, and training-state recovery is not provided. KohakuMossTrainer verification status is described in its own section below.
 
 The application never downloads, updates or deletes engine repositories for you. After cloning or copying source, confirm "install engine environment" on the engine page without binding Python first: the app prepares its project-local uv and then runs that engine's own installation flow, streaming and persisting logs. When installation finishes it discovers and saves the engine interpreter, runs diagnostics and writes the state back; a failed diagnosis is never reported as success. The bundled `python_runtime` only runs standard-library bootstrap scripts and never holds training dependencies; the base Python is managed by the project-local uv, and each engine keeps its own `venv` / `.venv`. Kohya's official installer may initialize sd-scripts submodules, and AI Toolkit's official manager may install the Node or ffmpeg it needs.
+
+## KohakuMossTrainer adaptation (this fork)
+
+> **Status: Experimental.** The earlier MOSS short-run flow passed, but the latest fix ("official generated config as the baseline; INT8 bases are no longer dequantized") **has not been re-verified on a GPU**. Until a real weight load and short training run are done, treat the MOSS adaptation as testable but not guaranteed stable.
+
+This repository is a fork of [LinXce/LP-Lora-Trainer](https://github.com/LinXce/LP-Lora-Trainer). It keeps the upstream multi-engine application (Kohya / AI Toolkit / Musubi Tuner), the original UI and the original workflow, and only enhances **native KohakuMossTrainer CLI** support. GPU detection, VRAM presets, quantized loading, kernel tuning, caching and sampling stay in the upstream trainer; this project **does not modify upstream source**.
+
+### How the config is generated
+
+- The baseline is the official `kohakumoss-config new train` output; LP only appends the user's changes instead of writing 121 static defaults.
+- **No `--vram` by default**: the generator detects the local card and selects the matching layer (a 12 GiB card gets `vram_12g`). `--vram auto` (dynamic memory planning, faster but uses more VRAM) and a numeric GiB budget are passed only when the user chooses them.
+- Only parameters the user **explicitly changed** are written, based on the recorded `explicit_params` list rather than "value differs from the default". API clients that omit the list keep the old rule: every submitted key is an override.
+- Dictionary knobs (`SCHEDULE`, `TEXT_ENCODE`, `VAE_ENCODE`, ...) are merged onto the value inherited from the official `use_config` layers; a sub-schedule map for `SCHEDULE` replaces it whole, as the engine expects.
+- `BASE_PRECISION` is inherited by default (not written), so INT8 ConvRot weights keep their native quantization; only an explicit `compute` dequantizes them.
+- **The one deliberate compatibility difference**: `TEXT_PINNED` defaults to `off`, which adds `pinned=false` to the official `TEXT_ENCODE` plan to avoid `cuMemHostAlloc` OOM on a 32 GB host. Choose `inherit` to write no `pinned` at all; the composed values then match the official output (only job input/output paths, weight path separators and the dataset `weight` metadata differ). The project therefore does not claim a "100% native" config; the difference is explicit and can be switched off.
+
+### MOSS workflow support
+
+- **ComfyUI weight folder**: `diffusion_models/` + `text_encoders/` + `vae/`, an HF folder with `transformer/`, or a single DiT safetensors.
+- **INT8 ConvRot**: loaded with the official precision setting instead of being force-dequantized by LP.
+- **Native cache and training**: latents → text encoder → training all call the upstream scripts; the final config is validated with the engine's own `check` before submission.
+- **Sampling and monitoring**: step / loss / lr / grad_norm are parsed from official logs, sampler step counters never overwrite training progress, and the task page shows the loss curve next to the latest samples with clickable history steps.
+- **Results page**: samples are grouped by step for comparison, and `grid.png` is shown separately as the summary sheet.
+
+### Windows install, launch and engine binding
+
+1. **Install**: run `install.cmd` from "Build from source" below, or use a complete distribution folder containing `python_runtime/`, `frontend/dist/` and `LP-Lora-Trainer.exe`; double-click the EXE to start (see "Portable use").
+2. **Prepare the engine**: copy trusted KohakuMossTrainer source into `engine/<instance>/`, rescan on the engine page and confirm it is detected as MOSS.
+3. **Install the engine environment**: click "install engine environment" and let the upstream installer create its `.venv`; the app then discovers the interpreter and diagnoses it. An existing environment can also be bound and diagnosed manually.
+4. **Basic flow**: register and scan a dataset → choose engine, ComfyUI weight folder and dataset on the new-training page → review parameters and the native config preview → submit → follow loss and samples on the task page → publish to the ComfyUI LoRA folder from the results page. The memory preset defaults to `auto`; change `VRAM` or the manual memory knobs only when needed.
+
+### Known limits
+
+- MOSS support covers MOSS-Image (Base / SFT) only; multi-GPU and long runs are unverified.
+- No seed-reproducibility guarantee, no guaranteed checkpoint integrity after an interruption, and no training-state recovery.
+- Old `job.json` files have no explicit-override record, so restoring or exporting them treats every parameter as an override (same as the previous behaviour).
 
 ## Build from source after cloning
 

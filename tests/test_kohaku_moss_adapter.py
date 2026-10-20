@@ -265,6 +265,35 @@ class MossAdapterTests(unittest.TestCase):
         self.assertEqual({"pinned": True},
                          self.adapter._text_plan({"TEXT_ENCODE": '{"pinned": true}'}, {"TEXT_ENCODE"}))
 
+    def test_text_pinned_inherit_leaves_the_official_plan_untouched(self):
+        # "inherit" is the fully native mode: no TEXT_ENCODE line at all when the user
+        # changed nothing else, and no cache-stage plan either.
+        spec_ = spec("TEXT_PINNED")
+        self.assertEqual("off", spec_.default)
+        self.assertEqual(["off", "inherit", "on"],
+                         [option[0] for option in (spec_.options or [])])
+        values = {p.key: p.default for p in PARAMS}
+        values["TEXT_PINNED"] = "inherit"
+        self.assertEqual({}, self.adapter._text_plan(values, set()))
+
+        config = self.config(self.comfy_weights(), TEXT_PINNED="inherit")
+        config["explicit_params"] = []
+        lines = self.render_lines(config)
+        self.assertEqual(["WEIGHTS", "DATASETS", "OUTPUT_DIR", "RUN_NAME"],
+                         [line.split(" = ")[0] for line in lines if " = " in line])
+        self.assertEqual([], self.adapter._render_cache_values(config))
+
+    def test_text_pinned_can_be_forced_on(self):
+        values = {p.key: p.default for p in PARAMS}
+        values["TEXT_PINNED"] = "on"
+        self.assertEqual({"pinned": True}, self.adapter._text_plan(values, set()))
+        config = self.config(self.comfy_weights(), TEXT_PINNED="on")
+        config["explicit_params"] = []
+        lines = self.render_lines(config)
+        plan = ast.literal_eval(next(line for line in lines if line.startswith("TEXT_ENCODE = "))
+                                .split(" = ", 1)[1])
+        self.assertIs(True, plan["pinned"])
+
     def test_progress_reads_lr_and_grad_norm_and_skips_the_return_value_echo(self):
         line = ("[19:48:45] [training.callbacks.monitor] [INFO] "
                 "step 16 [loss=0.5118, grad_norm=0.02272, lr=1.17e-05]")

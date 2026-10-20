@@ -1,0 +1,44 @@
+LP-Lora-Trainer
+Copyright (c) the LP-Lora-Trainer authors
+
+This product includes software developed as LP-Lora-Trainer
+(https://github.com/LinXce/LP-Lora-Trainer) and is licensed under the
+Apache License, Version 2.0 (see LICENSE).
+
+This repository is a fork of that project. It retains the upstream
+multi-engine application and adds a native KohakuMossTrainer CLI
+adaptation. The upstream trainer (D:\tools\KohakuMossTrainer in the
+developer's environment, distributed separately) is not modified and is
+not included in this repository.
+
+Modified files relative to the upstream baseline (6d5f6de):
+
+  adapters/kohaku_moss_trainer/adapter.py
+  adapters/kohaku_moss_trainer/params.py
+  adapters/kohaku_moss_trainer/progress.py
+  app/api/models.py
+  app/api/server.py
+  app/services/training.py
+  frontend/src/api/index.ts
+  frontend/src/features/draftStore.ts
+  frontend/src/features/trainingExport.ts
+  frontend/src/pages/NewTrainingPage.vue
+  frontend/src/pages/ResultsPage.vue
+  frontend/src/pages/TasksPage.vue
+  frontend/src/types/api.ts
+  supervisor/worker.py
+  tests/test_functionality.py
+  tests/test_kohaku_moss_adapter.py (new)
+  README.md
+  README.zh-CN.md
+  NOTICE (this file, new)
+
+Summary of changes: generate the training config with the official
+`kohakumoss-config new train` and append only explicit user overrides;
+inherit official VRAM/quantization defaults (INT8 ConvRot is not
+dequantized); record explicit overrides end to end; add the MOSS task
+progress/artifacts UI; document the adaptation and its experimental
+status.
+
+The fork is maintained independently and is not an official release of
+the upstream project.
